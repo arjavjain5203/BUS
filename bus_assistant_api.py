@@ -4,6 +4,8 @@ import os
 from dotenv import load_dotenv
 from google.generativeai import configure, GenerativeModel
 from collections import deque
+from fastapi import FastAPI
+from pydantic import BaseModel
 
 # -------------------------
 # 1. Load .env config
@@ -24,7 +26,7 @@ configure(api_key=API_KEY)
 model = GenerativeModel("gemini-1.5-flash")
 
 # -------------------------
-# 3. Configure MySQL (Aiven)
+# 3. Configure MySQL
 # -------------------------
 db = mysql.connector.connect(
     host=DB_HOST,
@@ -35,18 +37,18 @@ db = mysql.connector.connect(
 )
 cursor = db.cursor(dictionary=True)
 
+# -------------------------
+# 4. Memory
+# -------------------------
 chat_history = deque(maxlen=5)
 
 def get_chat_context():
-    """Format chat history into a context string."""
     return "\n".join([f"User: {u}\nBot: {b}" for u, b in chat_history])
 
-
-
-
 # -------------------------
-# 4. Prompt Helpers
+# 5. Prompt Helpers
 # -------------------------
+
 SCHEMA_PROMPT = """
 You are a SQL assistant for a Punjab transport database.
 Rules:
@@ -95,8 +97,6 @@ LIMIT 3;
 """
 
 
-#####################
-
 def generate_sql(user_input: str) -> str:
     context = get_chat_context()
     response = model.generate_content(
@@ -113,40 +113,43 @@ def format_response(raw_results: list, user_input: str) -> str:
     return response.text.strip()
 
 # -------------------------
-# 6. Chat Loop
+# 6. FastAPI Setup
 # -------------------------
-def chat_loop(user_id=1):
-    print("🚍 Punjab Bus Assistant (with memory) (type 'exit' to quit)\n")
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() in ["exit", "quit"]:
-            break
+app = FastAPI(title="Punjab Bus Assistant API")
 
-        sql_query = generate_sql(user_input)
-        print(f"[DEBUG] SQL Query: {sql_query}")
+class ChatRequest(BaseModel):
+    user_id: int = 1
+    message: str
 
-        try:
-            cursor.execute(sql_query)
-            results = cursor.fetchall()
-        except Exception as e:
-            results = {"error": str(e)}
+@app.post("/chat")
+def chat_endpoint(req: ChatRequest):
+    user_input = req.message
+    user_id = req.user_id
 
-        response_text = format_response(results, user_input)
-        print("Bot:", response_text)
+    sql_query = generate_sql(user_input)
 
-        # Update memory
-        chat_history.append((user_input, response_text))
+    try:
+        cursor.execute(sql_query)
+        results = cursor.fetchall()
+    except Exception as e:
+        results = {"error": str(e)}
 
-        # Save in DB
-        insert_chat = """
-             INSERT INTO chatlogs (user_id, message_text, response_text, created_at)
-             VALUES (%s, %s, %s, %s)
-         """
-        cursor.execute(insert_chat, (user_id, user_input, response_text, datetime.datetime.now()))
-        db.commit()
+    response_text = format_response(results, user_input)
 
-if __name__ == "__main__":
-    chat_loop()
+    # Update memory
+    chat_history.append((user_input, response_text))
 
+    # Save in DB
+    insert_chat = """
+         INSERT INTO chatlogs (user_id, message_text, response_text, created_at)
+         VALUES (%s, %s, %s, %s)
+     """
+    cursor.execute(insert_chat, (user_id, user_input, response_text, datetime.datetime.now()))
+    db.commit()
 
-#########################
+    return {
+        "user_message": user_input,
+        "sql_query": sql_query,
+        "results": results,
+        "bot_response": response_text
+    }
